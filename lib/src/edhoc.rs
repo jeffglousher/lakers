@@ -1,4 +1,5 @@
 use lakers_shared::{Crypto as CryptoTrait, *};
+use subtle::ConstantTimeEq;
 
 pub fn edhoc_exporter(
     state: &Completed,
@@ -206,7 +207,7 @@ pub fn r_verify_message_3(
     );
 
     // verify mac_3
-    if state.mac_3 == expected_mac_3 {
+    if bool::from(state.mac_3.ct_eq(&expected_mac_3)) {
         let th_4 = compute_th_4(
             crypto,
             &state.th_3,
@@ -371,7 +372,7 @@ pub fn i_verify_message_2(
         &state.ead_2,
     );
 
-    if state.mac_2 == expected_mac_2 {
+    if bool::from(state.mac_2.ct_eq(&expected_mac_2)) {
         // step is actually from processing of message_3
         // but we do it here to avoid storing plaintext_2 in State
         let th_3 = compute_th_3(
@@ -839,23 +840,7 @@ fn decrypt_message_3(
     th_3: &BytesHashLen,
     message_3: &BufferMessage3,
 ) -> Result<BufferPlaintext3, EDHOCError> {
-    // decode message_3
-    let bytestring_length: usize;
-    let prefix_length;
-    // FIXME: Reuse CBOR decoder
-    if (0..=23).contains(&(message_3.content[0] ^ CBOR_MAJOR_BYTE_STRING)) {
-        bytestring_length = (message_3.content[0] ^ CBOR_MAJOR_BYTE_STRING).into();
-        prefix_length = 1;
-    } else {
-        // FIXME: Assumes we don't exceed 256 bytes which is the current buffer size
-        bytestring_length = message_3.content[1].into();
-        prefix_length = 2;
-    }
-
-    let mut ciphertext_3: BufferCiphertext3 = BufferCiphertext3::new();
-    ciphertext_3.len = bytestring_length;
-    ciphertext_3.content[..bytestring_length]
-        .copy_from_slice(&message_3.content[prefix_length..][..bytestring_length]);
+    let ciphertext_3 = decode_ciphertext(message_3)?;
 
     let (k_3, iv_3) = compute_k_3_iv_3(crypto, prk_3e2m, th_3);
 
@@ -907,29 +892,29 @@ fn decrypt_message_4(
     th_4: &BytesHashLen,
     message_4: &BufferMessage4,
 ) -> Result<BufferPlaintext4, EDHOCError> {
-    // decode message_4
-    let bytestring_length: usize;
-    let prefix_length;
-    // FIXME: Reuse CBOR decoder
-    if (0..=23).contains(&(message_4.content[0] ^ CBOR_MAJOR_BYTE_STRING)) {
-        bytestring_length = (message_4.content[0] ^ CBOR_MAJOR_BYTE_STRING).into();
-        prefix_length = 1;
-    } else {
-        // FIXME: Assumes we don't exceed 256 bytes which is the current buffer size
-        bytestring_length = message_4.content[1].into();
-        prefix_length = 2;
-    }
-
-    let mut ciphertext_4: BufferCiphertext4 = BufferCiphertext4::new();
-    ciphertext_4.len = bytestring_length;
-    ciphertext_4.content[..bytestring_length]
-        .copy_from_slice(&message_4.content[prefix_length..][..bytestring_length]);
+    let ciphertext_4 = decode_ciphertext(message_4)?;
 
     let (k_4, iv_4) = compute_k_4_iv_4(crypto, prk_4e3m, th_4);
 
     let enc_structure = encode_enc_structure(th_4);
 
     crypto.aes_ccm_decrypt_tag_8(&k_4, &iv_4, &enc_structure, &ciphertext_4)
+}
+
+fn decode_ciphertext(message: &EdhocMessageBuffer) -> Result<EdhocMessageBuffer, EDHOCError> {
+    let input = message
+        .content
+        .get(..message.len)
+        .ok_or(EDHOCError::ParsingError)?;
+    let mut decoder = CBORDecoder::new(input);
+    let ciphertext = decoder.bytes()?;
+    decoder.ensure_finished()?;
+    if ciphertext.len() < AES_CCM_TAG_LEN
+        || (ciphertext.len() < 24 && input.first() == Some(&CBOR_BYTE_STRING))
+    {
+        return Err(EDHOCError::ParsingError);
+    }
+    EdhocMessageBuffer::new_from_slice(ciphertext).map_err(|_| EDHOCError::ParsingError)
 }
 
 // output must hold id_cred.len() + cred.len()
@@ -1511,6 +1496,67 @@ mod tests {
             decrypt_message_3(&mut default_crypto(), &PRK_3E2M_TV, &TH_3_TV, &message_3_tv);
         assert!(plaintext_3.is_ok());
         assert_eq!(plaintext_3.unwrap(), plaintext_3_tv);
+    }
+
+    #[test]
+    fn malformed_ciphertext_messages_are_rejected_before_decryption() {
+        let inputs: &[&[u8]] = &[
+            &[],
+            &[0x40],
+            &[0x47, 0, 0, 0, 0, 0, 0, 0],
+            &[0x48],
+            &[0x58],
+            &[0x58, 0xff],
+            &[0x58, 8, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0x68, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0x48, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        for input in inputs {
+            let message = EdhocMessageBuffer::new_from_slice(input).unwrap();
+            assert!(matches!(
+                decrypt_message_3(&mut default_crypto(), &PRK_3E2M_TV, &TH_3_TV, &message),
+                Err(EDHOCError::ParsingError)
+            ));
+            assert!(matches!(
+                decrypt_message_4(&mut default_crypto(), &PRK_4E3M_TV, &TH_4_TV, &message),
+                Err(EDHOCError::ParsingError)
+            ));
+        }
+    }
+
+    #[test]
+    fn ciphertext_message_decoder_obeys_logical_length_and_bounds() {
+        for length in [
+            8,
+            23,
+            24,
+            core::cmp::min(MAX_MESSAGE_SIZE_LEN - 2, u8::MAX as usize),
+        ] {
+            let mut message = EdhocMessageBuffer::new();
+            let prefix_length = if length < 24 {
+                message.content[0] = CBOR_MAJOR_BYTE_STRING | length as u8;
+                1
+            } else {
+                message.content[0] = CBOR_BYTE_STRING;
+                message.content[1] = length as u8;
+                2
+            };
+            message.content[prefix_length..prefix_length + length].fill(0x5a);
+            message.len = prefix_length + length;
+            let ciphertext = decode_ciphertext(&message).unwrap();
+            assert_eq!(ciphertext.as_slice(), &message.as_slice()[prefix_length..]);
+            message.len -= 1;
+            assert!(matches!(
+                decode_ciphertext(&message),
+                Err(EDHOCError::ParsingError)
+            ));
+        }
+        let mut message = EdhocMessageBuffer::new();
+        message.len = MAX_MESSAGE_SIZE_LEN + 1;
+        assert!(matches!(
+            decode_ciphertext(&message),
+            Err(EDHOCError::ParsingError)
+        ));
     }
 
     #[test]

@@ -1064,9 +1064,10 @@ mod cbor_decoder {
             } else if (0x20..=0x37).contains(&n) {
                 Ok(-1 - (n - 0x20) as i8)
             } else if 0x18 == n {
-                Ok(self.read()? as i8)
+                i8::try_from(self.read()?).map_err(|_| CBORError::DecodingError)
             } else if 0x38 == n {
-                Ok(-1 - (self.read()? - 0x20) as i8)
+                let argument = i8::try_from(self.read()?).map_err(|_| CBORError::DecodingError)?;
+                Ok(-1 - argument)
             } else {
                 Err(CBORError::DecodingError)
             }
@@ -1177,7 +1178,7 @@ mod cbor_decoder {
         /// To have bound memory requirements, this depends on the encoded data to be in
         /// deterministic encoding, thus not having any indeterminate length items.
         pub fn any_as_encoded(&mut self) -> Result<&'a [u8], CBORError> {
-            let mut remaining_items = 1;
+            let mut remaining_items: u16 = 1;
             let start = self.position();
 
             // Instead of `while remaining_items > 0`, this loop helps hax to see that the loop
@@ -1216,23 +1217,34 @@ mod cbor_decoder {
                         0..=1 => (), // Argument consumed, remaining items were already decremented
                         7 => (), // Same, but in separate line due to Hax FStar backend limitations
                         6 => {
-                            remaining_items += 1;
+                            remaining_items = remaining_items
+                                .checked_add(1)
+                                .ok_or(CBORError::DecodingError)?;
                         }
                         2..=3 => {
                             self.read_slice(argument.into())?;
                         }
                         4 => {
-                            remaining_items += argument;
+                            remaining_items = remaining_items
+                                .checked_add(u16::from(argument))
+                                .ok_or(CBORError::DecodingError)?;
                         }
                         5 => {
-                            remaining_items += argument * 2;
+                            remaining_items = u16::from(argument)
+                                .checked_mul(2)
+                                .and_then(|entries| remaining_items.checked_add(entries))
+                                .ok_or(CBORError::DecodingError)?;
                         }
                         _ => unreachable!("Value is result of a right shift trimming it to 3 bits"),
                     }
                 }
             }
 
-            Ok(&self.buf[start..self.position()])
+            if remaining_items == 0 {
+                Ok(&self.buf[start..self.position()])
+            } else {
+                Err(CBORError::DecodingError)
+            }
         }
     }
 }
@@ -1241,6 +1253,59 @@ mod cbor_decoder {
 mod test_cbor_decoder {
     use super::cbor_decoder::*;
     use hexlit::hex;
+
+    #[test]
+    fn container_counts_and_truncated_items_are_rejected() {
+        let inputs: &[&[u8]] = &[
+            &[],
+            &[0x81],
+            &[0xa1],
+            &[0xc0],
+            &[0x81, 0x81],
+            &[0xa1, 0x00],
+            &[0xb8, 0xff],
+            &[0xa1, 0x0e, 0xb8, 0xff],
+        ];
+        for input in inputs {
+            assert!(CBORDecoder::new(input).any_as_encoded().is_err());
+        }
+        let mut input = [0u8; 513];
+        input[..2].copy_from_slice(&[0xb8, 0xff]);
+        let mut decoder = CBORDecoder::new(&input);
+        assert_eq!(decoder.any_as_encoded().unwrap(), &input[..512]);
+        assert!(!decoder.finished());
+        assert_eq!(decoder.u8().unwrap(), 0);
+        assert!(decoder.finished());
+    }
+
+    #[test]
+    fn nested_container_count_overflow_is_rejected() {
+        let mut input = [0u8; 264];
+        for pair in input.chunks_exact_mut(2) {
+            pair.copy_from_slice(&[0xb8, 0xff]);
+        }
+        assert!(CBORDecoder::new(&input).any_as_encoded().is_err());
+    }
+
+    #[test]
+    fn extended_signed_integers_preserve_values_and_reject_overflow() {
+        for argument in 0u8..=127 {
+            assert_eq!(
+                CBORDecoder::new(&[0x18, argument]).i8().unwrap(),
+                argument as i8
+            );
+            assert_eq!(
+                CBORDecoder::new(&[0x38, argument]).i8().unwrap(),
+                -1 - argument as i8
+            );
+        }
+        for argument in 128u8..=255 {
+            assert!(CBORDecoder::new(&[0x18, argument]).i8().is_err());
+            assert!(CBORDecoder::new(&[0x38, argument]).i8().is_err());
+        }
+        assert!(CBORDecoder::new(&[0x18]).i8().is_err());
+        assert!(CBORDecoder::new(&[0x38]).i8().is_err());
+    }
 
     #[test]
     fn test_cbor_decoder() {
